@@ -60,6 +60,8 @@ end
 module ActiveRecord
   class Base
     DEFAULT_CONFIG = { :username => 'dba', :password => 'sql' }
+    CREATE_DB_CONFIG = %i(collation ncollation page_size jconnect checksum system_proc_as_definer blank_padding user_id)
+
     # Main connection function to SQL Anywhere
     # Connection Adapter takes four parameters:
     # * :database (required, no default). Corresponds to "DatabaseName=" in connection string
@@ -92,6 +94,10 @@ module ActiveRecord
         # we have to delete pool if it is available
         config.delete(:pool)
         config.delete(:adapter)
+
+
+        config.except! *CREATE_DB_CONFIG
+
         # Then add all other connection settings
         config.each_pair do |k, v|
           connection_string += "#{k}=#{v};"
@@ -120,6 +126,8 @@ module ActiveRecord
       include SQLAnywhere::Quoting
       attr_reader :connection_string
 
+      ADAPTER_NAME = "SQLAnywhere".freeze
+
       def arel_visitor
         Arel::Visitors::SQLAnywhere.new self
       end
@@ -144,12 +152,52 @@ module ActiveRecord
         select_value "SELECT DB_PROPERTY('Name')", "SCHEMA"
       end
 
+      def collation
+        select_value "SELECT DB_EXTENDED_PROPERTY('Collation', 'Specification')", "SCHEMA"
+      end
+
+      def charset
+        select_value "SELECT DB_PROPERTY('CharSet')", "SCHEMA"
+      end
+
+      def ncollation
+        select_value "SELECT DB_EXTENDED_PROPERTY('NcharCollation', 'Specification')", "SCHEMA"
+      end
+
+      def ncharset
+        select_value "SELECT DB_PROPERTY('CharSet')", "SCHEMA"
+      end
+
       def explain(arel, binds = [])
         raise NotImplementedError
       end
 
-      def adapter_name #:nodoc:
-        'SQLAnywhere'
+      def truncate_table(table_name)
+        execute "TRUNCATE TABLE #{quote_table_name table_name}"
+      end
+
+      def start_database dbf, dbname
+        execute "START DATABASE '#{dbf}' AS #{dbname} AUTOSTOP OFF"
+      end
+
+      def stop_database database
+        execute("STOP DATABASE #{database} UNCONDITIONALLY")
+      rescue ActiveRecord::StatementInvalid => error # Если БД нет, то все ОК
+        raise unless error.is_a? ActiveRecord::NoDatabaseError
+      end
+
+      def drop_database dbf
+        execute("DROP DATABASE '#{dbf}'")
+      rescue ActiveRecord::StatementInvalid => error # Если БД нет, то все ОК
+        raise unless error.is_a? ActiveRecord::NoDatabaseError
+      end
+
+      # id нужен для того, что бы созадть пользователя под тем же идентификатором, под котором он заведен в продакшен
+      # это позволит в дальнейшем накатить дамп
+      def create_admin_user username, password, id=nil
+        at_part = id.present? ? "AT #{id}" : ""
+        execute "GRANT CONNECT TO \"#{username}\" #{at_part} IDENTIFIED BY '#{password}';"
+        execute "GRANT ROLE \"SYS_AUTH_DBA_ROLE\" TO \"#{username}\"  WITH ADMIN OPTION WITH NO SYSTEM PRIVILEGE INHERITANCE;"
       end
 
       # Не работает, надо названия таблиц доработать
@@ -263,6 +311,8 @@ module ActiveRecord
             raise ActiveRecord::InvalidForeignKey.new encoded_msg
           when -196
             raise ActiveRecord::RecordNotUnique.new encoded_msg
+          when -83
+            raise ActiveRecord::NoDatabaseError.new encoded_msg
           when -183
             raise ArgumentError, encoded_msg
           else
@@ -674,7 +724,11 @@ module ActiveRecord
             set_connection_options
           else
             error = SA.instance.api.sqlany_error(@connection)
-            raise ActiveRecord::ActiveRecordError.new("#{error}: Cannot Establish Connection")
+            if error[1] == "Specified database not found"
+              raise ActiveRecord::NoDatabaseError
+            else
+              raise ActiveRecord::ActiveRecordError.new("#{error}: Cannot Establish Connection")
+            end
           end
         end
 
